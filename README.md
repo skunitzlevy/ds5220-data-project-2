@@ -4,7 +4,7 @@ Create, schedule, and run a containerized data pipeline in Kubernetes.
 
 ## Overview
 
-In this project you will design, containerize, schedule, and operate a real data pipeline running inside a Kubernetes host on AWS. A working sample application is provided that tracks the International Space Station every 15 minutes, records its position and altitude in DynamoDB, and detects orbital burns when the altitude is raised significantly. You will study how that pipeline works, then build your own data application that collects data on a schedule, persists it, and publishes an evolving plot to a public S3 website.
+In this project you will design, containerize, schedule, and operate a real data pipeline running inside a Kubernetes host on AWS. This repository now contains a weather pipeline that polls the Open-Meteo API every 10 minutes for Charleston, SC, stores the readings in DynamoDB, and publishes an evolving plot to an S3 website.
 
 Your pipeline should run for at least 72 hours, collecting at least 72 data points. Choose a data source that is updated at least hourly.
 
@@ -33,7 +33,7 @@ Create a new bucket for this project, enable it as a website, and make all files
 
 Create a `t3.large` Ubuntu 24.04 LTS instance with a 30GB boot volume. Attach an Elastic IP so your host address stays consistent. Attach a Security Group that allows inbound access on ports 22, 80, 8000, and 8080. Give the instance an IAM Role with:
 - **S3**: `PutObject`, `GetObject` on your website bucket
-- **DynamoDB**: `PutItem`, `GetItem`, `Query` on your tracking table named `iss-tracking`.
+- **DynamoDB**: `PutItem`, `GetItem`, `Query` on your tracking table named `weather-tracking`.
 
 ### 3. Install K3S
 
@@ -94,13 +94,13 @@ kubectl delete -f simple-job.yaml
 
 ---
 
-## Sample Data Application — ISS Reboost Tracker
+## Sample Data Application — Charleston Weather Tracker
 
-The sample application in the `iss-reboost/` directory tracks the location, speed, and altitude of the **International Space Station** every 15 minutes. Due to normal atmospheric drag (even at 400 km up) there's enough residual atmosphere to gradually slow the station and lower its orbit. Left unchecked, the ISS would reenter within a few years. To mitigate this, the ISS performs "reboost burns" periodically to restore a higher altitude.
+The application in the `iss-reboost/` directory now fetches current weather conditions for Charleston, South Carolina from the Open-Meteo API every 10 minutes. Each run stores a timestamped weather snapshot in DynamoDB, reads the full history back out, and regenerates a plot showing how the temperature gap and wind speed change over time.
 
 ```mermaid
 flowchart LR
-    ISS_API["🛰️ wheretheiss.at\nPublic API"]
+    WEATHER_API["🌤️ Open-Meteo\nPublic API"]
     GHCR["📦 GHCR\nContainer Registry"]
 
     subgraph AWS["☁️  AWS"]
@@ -111,21 +111,20 @@ flowchart LR
         style EC2 fill:#eee,stroke:#e76f51,color:#000
             subgraph K3S["K3S Kubernetes"]
             style K3S fill:#eee,stroke:#e76f51,color:#000
-                CRON["⏱️ CronJob\nevery 15 minutes"]
+                CRON["⏱️ CronJob\nevery 10 minutes"]
                 POD["🐳 Pod\napp.py"]
             end
         end
 
-        DDB[("🗄️ DynamoDB\niss-tracking")]
-        S3["🪣 S3 Website\niss-altitude.png"]
+        DDB[("🗄️ DynamoDB\nweather-tracking")]
+        S3["🪣 S3 Website\nweather-timeseries.png"]
     end
 
     BROWSER["🌐 Public Browser"]
 
     GHCR -->|"pull image"| CRON
     CRON -->|"spawns"| POD
-    ISS_API -->|"position + altitude"| POD
-    POD -->|"query last entry"| DDB
+    WEATHER_API -->|"current weather"| POD
     POD -->|"write new record"| DDB
     POD -->|"read full history"| DDB
     POD -->|"upload plot"| S3
@@ -136,11 +135,11 @@ flowchart LR
 
 On each run this application performs the following tasks:
 
-1. Calls the [wheretheiss.at](https://api.wheretheiss.at/v1/satellites/25544) API to get the ISS's current latitude, longitude, altitude, and velocity — no API key required.
-2. Queries DynamoDB for the most recent previous entry and computes the altitude delta.
-3. Labels the trend: `ASCENDING`, `DESCENDING`, `STABLE`, or `ORBITAL_BURN` (altitude gain ≥ 1 km, indicating a reboost maneuver).
+1. Calls the [Open-Meteo forecast API](https://open-meteo.com/en/docs) for Charleston weather data with Fahrenheit temperatures.
+2. Extracts the current `temperature_2m`, `apparent_temperature`, `wind_speed_10m`, and `precipitation` fields.
+3. Computes `temp_gap_f = temperature_2m - apparent_temperature`.
 4. Writes the full record to DynamoDB.
-5. Reads the full history from DynamoDB, renders an altitude-over-time plot, and uploads it to S3.
+5. Reads the full history from DynamoDB, renders a plot of temperature gap and wind speed over time, and uploads it to S3.
 
 ### Create the DynamoDB Table
 
@@ -148,41 +147,41 @@ Before deploying the job, create the table from the AWS CLI on your EC2 instance
 
 ```bash
 aws dynamodb create-table \
-  --table-name iss-tracking \
+  --table-name weather-tracking \
   --attribute-definitions \
-    AttributeName=satellite_id,AttributeType=S \
+    AttributeName=source_id,AttributeType=S \
     AttributeName=timestamp,AttributeType=S \
   --key-schema \
-    AttributeName=satellite_id,KeyType=HASH \
+    AttributeName=source_id,KeyType=HASH \
     AttributeName=timestamp,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST \
   --region us-east-1
 ```
 
-The **partition key** is `satellite_id` (always `"ISS"`) and the **sort key** is `timestamp` (ISO 8601 UTC string). The sort key keeps all records in chronological order and makes it trivial to retrieve the most recent entry with a single `Query`.
+The **partition key** is `source_id` (for example `"charleston-weather"`) and the **sort key** is `timestamp` (ISO 8601 UTC string). The sort key keeps all records in chronological order and makes it trivial to retrieve the full time series or newest record with a single `Query`.
 
 ### Build and Push the Container
 
 A published image already exists (see the YAML file) but if you want to build and push it yourself, see below. Remember `arm64` vs. `amd64` architecture (Mac users), so you may need to use a GitHub Action for builds (See Lab 6).
 
 ```bash
-cd iss/
+cd iss-reboost/
 docker login ghcr.io        # GitHub username + Personal Access Token
-docker build -t ghcr.io/USERNAME/ds5220-iss:latest .
-docker push ghcr.io/USERNAME/ds5220-iss:latest
+docker build -t ghcr.io/skunitzlevy/weather-tracker:latest .
+docker push ghcr.io/skunitzlevy/weather-tracker:latest
 ```
 
 Under **Packages** in your GitHub profile, find the image and set its visibility to **Public** so Kubernetes can pull it.
 
-### Deploy the ISS CronJob
+### Deploy the Weather CronJob
 
-Edit `iss-job.yaml` and replace `USERNAME` with your GitHub username, then apply it:
+Edit `iss-job.yaml` and set `S3_BUCKET` to your website bucket name, such as `ds5220-weather`, then apply it:
 
 ```bash
 kubectl apply -f iss-job.yaml
 ```
 
-The job fires every 15 minutes. Monitor it:
+The job fires every 10 minutes. Monitor it:
 
 ```bash
 kubectl get cronjobs
@@ -193,22 +192,16 @@ kubectl logs <pod-name>
 A healthy log line looks like:
 
 ```
-ISS | alt=415.823 km | delta=-0.031 km | DESCENDING    | lat=21.4521 | lon=-143.2918 | visibility=daylight
-```
-
-An orbital burn entry looks like:
-
-```
-ISS | alt=417.614 km | delta=+2.103 km | ORBITAL_BURN  | lat=34.1124 | lon=12.0043 | visibility=eclipsed  *** ORBITAL BURN DETECTED ***
+WEATHER | temp=67.8 F | feels_like=63.2 F | gap=4.6 F | wind=15.4 km/h | precip=0.0 mm
 ```
 
 Query your data directly from the CLI to verify accumulation:
 
 ```bash
 aws dynamodb query \
-  --table-name iss-tracking \
-  --key-condition-expression "satellite_id = :id" \
-  --expression-attribute-values '{":id": {"S": "ISS"}}' \
+  --table-name weather-tracking \
+  --key-condition-expression "source_id = :id" \
+  --expression-attribute-values '{":id": {"S": "charleston-weather"}}' \
   --max-items 5 \
   --region us-east-1
 ```
@@ -281,6 +274,6 @@ Submit the following in the Canvas assignment:
 In addition to the above, submit a short written response (one paragraph each) to the following:
 
 1. In the ISS sample application, data is persisted in DynamoDB. If this were a much higher-frequency application (hundreds of writes per minute), what changes would you make to the persistence strategy and why?
-2. The ISS tracker detects orbital burns by comparing consecutive altitude readings. Describe at least one way this detection logic could produce a false positive, and how you would make it more robust.
+2. In the weather tracker, the plot combines temperature gap and wind speed on the same time axis. What tradeoffs does that introduce compared with plotting them separately, and how would you decide which presentation is better?
 3. How does each `CronJob` pod get AWS permissions without credentials being passed into the container?
-4. Notice the structure of the `iss-tracking` table in DynamoDB. What is the partition key and what is the sort key? Why do these work well in this example, but may not work for other solutions?
+4. Notice the structure of the `weather-tracking` table in DynamoDB. What is the partition key and what is the sort key? Why do these work well in this example, but may not work for other solutions?

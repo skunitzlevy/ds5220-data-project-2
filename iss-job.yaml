@@ -1,10 +1,10 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: iss-tracker
+  name: weather-tracker
   namespace: default
 spec:
-  schedule: "*/15 * * * *"     # runs every 15 minutes
+  schedule: "*/10 * * * *"     # runs every 10 minutes
   concurrencyPolicy: Forbid    # skip a run if the previous one is still going
   successfulJobsHistoryLimit: 10
   failedJobsHistoryLimit: 10
@@ -14,15 +14,21 @@ spec:
         spec:
           restartPolicy: OnFailure
           containers:
-            - name: iss-tracker
-              image: ghcr.io/nmagee/iss-reboost:latest
+            - name: weather-tracker
+              image: ghcr.io/skunitzlevy/weather-tracker:latest
               imagePullPolicy: Always
               env:
                 - name: DYNAMODB_TABLE
-                  value: "iss-tracking"
+                  value: "weather-tracking"
 
                 - name: S3_BUCKET
-                  value: "your-bucket-name"
+                  value: "ds5220-weather"
 
                 - name: AWS_REGION
                   value: "us-east-1"
+
+                - name: SOURCE_ID
+                  value: "charleston-weather"
+
+                - name: WEATHER_API_URL
+                  value: "https://api.open-meteo.com/v1/forecast?latitude=32.76&longitude=-79.83&current=temperature_2m,apparent_temperature,wind_speed_10m,precipitation&forecast_days=1&temperature_unit=fahrenheit"

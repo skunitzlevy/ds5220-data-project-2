@@ -17,92 +17,56 @@ matplotlib.use("Agg")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ISS_API      = "https://api.wheretheiss.at/v1/satellites/25544"
-SATELLITE_ID = "ISS"
-TABLE_NAME   = os.environ["DYNAMODB_TABLE"]
-S3_BUCKET    = os.environ["S3_BUCKET"]
-AWS_REGION   = os.environ.get("AWS_REGION", "us-east-1")
+WEATHER_API_URL = os.environ.get(
+    "WEATHER_API_URL",
+    (
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=32.76&longitude=-79.83"
+        "&current=temperature_2m,apparent_temperature,wind_speed_10m,precipitation"
+        "&forecast_days=1&temperature_unit=fahrenheit"
+    ),
+)
+SOURCE_ID = os.environ.get("SOURCE_ID", "charleston-weather")
+TABLE_NAME = os.environ["DYNAMODB_TABLE"]
+S3_BUCKET = os.environ["S3_BUCKET"]
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+PLOT_KEY = "weather-timeseries.png"
 
-# Altitude gain at or above this value in a single 15-minute interval is
-# flagged as a reboost / orbital burn. ISS reboosts typically raise the
-# orbit by 1–3 km; normal orbital decay between burns is ~0.05 km/interval.
-BURN_THRESHOLD_KM = Decimal("1.0")
 
-
-# ---------------------------------------------------------------------------
-# Step 1 — Fetch current ISS position from wheretheiss.at
-# ---------------------------------------------------------------------------
-def fetch_iss() -> dict:
-    """Return a DynamoDB-ready item with the current ISS state."""
-    resp = requests.get(ISS_API, timeout=10)
+def fetch_weather() -> dict:
+    """Fetch the current weather snapshot and return a DynamoDB-ready item."""
+    resp = requests.get(WEATHER_API_URL, timeout=10)
     resp.raise_for_status()
-    d = resp.json()
+    data = resp.json()
+    current = data["current"]
+
+    temperature = Decimal(str(current["temperature_2m"]))
+    apparent = Decimal(str(current["apparent_temperature"]))
+    wind_speed = Decimal(str(current["wind_speed_10m"]))
+    precipitation = Decimal(str(current["precipitation"]))
+
     return {
-        "satellite_id": SATELLITE_ID,
-        "timestamp":    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "latitude":     Decimal(str(round(d["latitude"],  6))),
-        "longitude":    Decimal(str(round(d["longitude"], 6))),
-        "altitude_km":  Decimal(str(round(d["altitude"],  3))),
-        "velocity_kms": Decimal(str(round(d["velocity"],  3))),
-        "visibility":   d.get("visibility", "unknown"),
+        "source_id": SOURCE_ID,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "api_time": current["time"],
+        "temperature_2m": temperature,
+        "apparent_temperature": apparent,
+        "temp_gap_f": temperature - apparent,
+        "wind_speed_10m": wind_speed,
+        "precipitation": precipitation,
+        "latitude": Decimal(str(data["latitude"])),
+        "longitude": Decimal(str(data["longitude"])),
     }
 
 
-# ---------------------------------------------------------------------------
-# Step 2 — Query DynamoDB for the most recent previous entry
-# ---------------------------------------------------------------------------
-def get_previous(table) -> dict | None:
-    """Return the latest stored item for ISS, or None on first run."""
-    resp = table.query(
-        KeyConditionExpression=Key("satellite_id").eq(SATELLITE_ID),
-        ScanIndexForward=False,   # descending timestamp order
-        Limit=1,
-    )
-    items = resp.get("Items", [])
-    return items[0] if items else None
-
-
-# ---------------------------------------------------------------------------
-# Step 3 — Compare current altitude to previous entry
-# ---------------------------------------------------------------------------
-def altitude_analysis(current_km: Decimal, previous: dict | None) -> tuple[str, Decimal]:
-    """Return (trend_label, delta_km) comparing current to previous altitude.
-
-    Trend labels:
-      FIRST_ENTRY  — no prior data to compare against
-      ASCENDING    — small natural gain (solar pressure, atmospheric variation)
-      DESCENDING   — normal orbital decay due to atmospheric drag
-      STABLE       — negligible change
-      ORBITAL_BURN — altitude jumped >= BURN_THRESHOLD_KM; reboost likely
-    """
-    if previous is None:
-        return "FIRST_ENTRY", Decimal("0")
-
-    delta = current_km - Decimal(str(previous["altitude_km"]))
-
-    if delta >= BURN_THRESHOLD_KM:
-        trend = "ORBITAL_BURN"
-    elif delta > Decimal("0.01"):
-        trend = "ASCENDING"
-    elif delta < Decimal("-0.01"):
-        trend = "DESCENDING"
-    else:
-        trend = "STABLE"
-
-    return trend, delta
-
-
-# ---------------------------------------------------------------------------
-# Step 4 — Fetch full altitude history from DynamoDB for plotting
-# ---------------------------------------------------------------------------
 def fetch_history(table) -> pd.DataFrame:
-    """Return all stored ISS records as a DataFrame, sorted by timestamp.
-    Handles DynamoDB pagination so the full history is always returned.
-    """
-    items, kwargs = [], dict(
-        KeyConditionExpression=Key("satellite_id").eq(SATELLITE_ID),
-        ScanIndexForward=True,
-    )
+    """Return all stored weather records as a DataFrame sorted by timestamp."""
+    items = []
+    kwargs = {
+        "KeyConditionExpression": Key("source_id").eq(SOURCE_ID),
+        "ScanIndexForward": True,
+    }
+
     while True:
         resp = table.query(**kwargs)
         items.extend(resp.get("Items", []))
@@ -114,65 +78,70 @@ def fetch_history(table) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(items)
-    df["timestamp"]   = pd.to_datetime(df["timestamp"])
-    df["altitude_km"] = df["altitude_km"].astype(float)
-    df["delta_km"]    = df["delta_km"].astype(float)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["temp_gap_f"] = df["temp_gap_f"].astype(float)
+    df["wind_speed_10m"] = df["wind_speed_10m"].astype(float)
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Step 5 — Render altitude-over-time plot
-# ---------------------------------------------------------------------------
 def generate_plot(df: pd.DataFrame) -> io.BytesIO | None:
-    """Plot ISS altitude over time with orbital burn annotations."""
+    """Plot temperature gap and wind speed over time."""
     if df.empty or len(df) < 2:
         log.info("Not enough history to plot yet (%d point(s))", len(df))
         return None
 
     sns.set_theme(style="darkgrid", context="talk", font_scale=0.9)
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+    ax2 = ax1.twinx()
 
-    # Altitude line
-    sns.lineplot(data=df, x="timestamp", y="altitude_km",
-                 ax=ax, color="#4FC3F7", linewidth=2.5, zorder=2)
-
-    # Subtle fill under the line
-    ax.fill_between(df["timestamp"], df["altitude_km"],
-                    df["altitude_km"].min() - 1,
-                    alpha=0.12, color="#4FC3F7")
-
-    # Highlight orbital burns with a scatter point + rocket annotation
-    burns = df[df["trend"] == "ORBITAL_BURN"]
-    if not burns.empty:
-        ax.scatter(burns["timestamp"], burns["altitude_km"],
-                   color="#FF6B35", s=140, zorder=4,
-                   label=f"Orbital burn ({len(burns)} detected)")
-        for _, row in burns.iterrows():
-            ax.annotate(
-                "🚀",
-                xy=(row["timestamp"], row["altitude_km"]),
-                xytext=(0, 14),
-                textcoords="offset points",
-                ha="center", fontsize=16, zorder=5,
-            )
-
-    ax.set_title(
-        "ISS Orbital Altitude\n"
-        f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        fontsize=14, fontweight="bold", pad=14,
+    sns.lineplot(
+        data=df,
+        x="timestamp",
+        y="temp_gap_f",
+        ax=ax1,
+        color="#D55E00",
+        linewidth=3,
+        marker="o",
+        markersize=8,
+        zorder=3,
+        label="Temp - Gap b/w Actual & Feels like (F)",
     )
-    ax.set_xlabel("Time (UTC)", labelpad=8)
-    ax.set_ylabel("Altitude (km)", labelpad=8)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.1f} km"))
+    sns.lineplot(
+        data=df,
+        x="timestamp",
+        y="wind_speed_10m",
+        ax=ax2,
+        color="#0072B2",
+        linewidth=2.5,
+        marker="o",
+        markersize=7,
+        zorder=2,
+        label="Wind Speed 10m (km/h)",
+    )
 
-    # Y axis: 300 km floor (well below ISS operational range), top padded 5% above highest reading
-    ax.set_ylim(300, df["altitude_km"].max() * 1.05)
+    temp_min = df["temp_gap_f"].min()
+    temp_max = df["temp_gap_f"].max()
+    pad = max(0.2, (temp_max - temp_min) * 0.2)
+    ax1.set_ylim(temp_min - pad, temp_max + pad)
 
-    if not burns.empty:
-        ax.legend(loc="upper right", fontsize=9, framealpha=0.85, edgecolor="#555555")
+    ax1.set_title(
+        "Sullivan's Island, Charleston Weather Conditions\n"
+        f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        fontsize=14,
+        fontweight="bold",
+        pad=14,
+    )
+    ax1.set_xlabel("Time (UTC)", labelpad=8)
+    ax1.set_ylabel("Temperature Gap (F)", labelpad=8, color="#D55E00")
+    ax2.set_ylabel("Wind Speed 10m (km/h)", labelpad=8, color="#0072B2")
 
-    sns.despine(ax=ax, top=True, right=True)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+
+    sns.despine(ax=ax1, top=True, right=False)
+    sns.despine(ax=ax2, top=True, left=False)
     fig.autofmt_xdate(rotation=25, ha="right")
     plt.tight_layout()
 
@@ -184,50 +153,34 @@ def generate_plot(df: pd.DataFrame) -> io.BytesIO | None:
     return buf
 
 
-# ---------------------------------------------------------------------------
-# Step 6 — Upload plot to S3
-# ---------------------------------------------------------------------------
 def push_plot(buf: io.BytesIO) -> None:
     s3 = boto3.client("s3", region_name=AWS_REGION)
     s3.put_object(
         Bucket=S3_BUCKET,
-        Key="iss-altitude.png",
+        Key=PLOT_KEY,
         Body=buf.getvalue(),
         ContentType="image/png",
     )
-    log.info("Uploaded iss-altitude.png to s3://%s", S3_BUCKET)
+    log.info("Uploaded %s to s3://%s", PLOT_KEY, S3_BUCKET)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 def main():
     dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-    table    = dynamodb.Table(TABLE_NAME)
+    table = dynamodb.Table(TABLE_NAME)
 
-    previous     = get_previous(table)
-    entry        = fetch_iss()
-    trend, delta = altitude_analysis(entry["altitude_km"], previous)
-
-    entry["trend"]    = trend
-    entry["delta_km"] = delta
-
+    entry = fetch_weather()
     table.put_item(Item=entry)
 
-    if trend == "FIRST_ENTRY":
-        log.info(
-            "ISS | alt=%.3f km | lat=%.4f | lon=%.4f | visibility=%s | FIRST ENTRY",
-            entry["altitude_km"], entry["latitude"], entry["longitude"], entry["visibility"],
-        )
-    else:
-        burn_flag = "  *** ORBITAL BURN DETECTED ***" if trend == "ORBITAL_BURN" else ""
-        log.info(
-            "ISS | alt=%.3f km | delta=%+.3f km | %-12s | lat=%.4f | lon=%.4f | visibility=%s%s",
-            entry["altitude_km"], delta, trend,
-            entry["latitude"], entry["longitude"], entry["visibility"], burn_flag,
-        )
+    log.info(
+        "WEATHER | temp=%.1f F | feels_like=%.1f F | gap=%.1f F | wind=%.1f km/h | precip=%.1f mm",
+        entry["temperature_2m"],
+        entry["apparent_temperature"],
+        entry["temp_gap_f"],
+        entry["wind_speed_10m"],
+        entry["precipitation"],
+    )
 
-    history  = fetch_history(table)
+    history = fetch_history(table)
     plot_buf = generate_plot(history)
     if plot_buf:
         push_plot(plot_buf)
